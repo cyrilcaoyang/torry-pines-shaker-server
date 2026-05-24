@@ -1,0 +1,41 @@
+# -- Torrey Pines shaker configuration ---------------------------------------
+# Copy this file to config.toml and edit to match your hardware:
+#   cp config.example.toml config.toml
+#
+# config.toml is gitignored - your local settings stay on your machine.
+
+[instrument]
+com_port = "COM3"                       # Serial port the shaker is on
+baudrate = 9600
+timeout = 1.0                           # PySerial read timeout (s)
+max_temp_c = 110                        # Driver-enforced upper bound (-20..+110)
+min_temp_c = -20
+
+# -- REST API service --------------------------------------------------------
+# Used by `python -m torry_pines_shaker_server` /
+# `torry-pines-shaker-serve`. Conforms to lab status spec v1.1.
+[service]
+host = "0.0.0.0"                        # Bind address (Tailscale-only by ACL)
+port = 8030                             # HTTP port
+dry_run = false                         # true = in-memory stub, no hardware
+cors_origins = ["*"]                    # Tailnet ACLs gate access
+startup_connect_timeout_s = 10.0        # Auto-connect timeout at service start
+enforce_claims = true                   # v1.1: require X-Claim-Token on /control/*
+                                        #   true  = strict (recommended in production)
+                                        #   false = advisory (publishes claimed_by but
+                                        #           does not block writes)
+watchdog_stop_on_exit = true            # Stop the motor on process shutdown.
+                                        # Strongly recommended - the recipe v2 §3.5
+                                        # contract relies on this.
+temperature_tolerance_c = 1.0           # +/- C considered "at setpoint" for the
+                                        # wait_for_temperature precondition.
+wait_for_temperature_timeout_s = 1800.0 # Cap on how long /control/shake/start
+                                        # waits for the heater before 412.
+
+# -- Dashboard identity ------------------------------------------------------
+# Reported in GET /status. Must match the entry in the dashboard's
+# `equipment.yaml` (id is the canonical key the aggregator joins on).
+[dashboard]
+equipment_id = "torry_pines_shaker"
+equipment_name = "Torrey Pines Shaker"
+# equipment_version = "0.1.0"           # optional - bump on driver releases

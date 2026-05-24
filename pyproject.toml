@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torry-pines-shaker-server"
+version = "0.1.0"
+description = "REST API for the Torrey Pines Scientific shaker (lab status spec v1.1)"
+readme = "README.md"
+authors = [
+    { name = "Yang Cao", email = "yangcyril.cao@utoronto.ca" },
+]
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "tomli>=2.0; python_version < '3.11'",
+    "matterlab_shakers",
+    "matterlab_serial_device",
+    "pyserial>=3.5",
+]
+
+[project.optional-dependencies]
+api = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.6",
+]
+dev = [
+    "pytest",
+    "httpx",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.6",
+]
+
+[project.scripts]
+torry-pines-shaker-serve = "torry_pines_shaker_server.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.uv.sources]
+matterlab_shakers = { git = "https://gitlab.com/aspuru-guzik-group/self-driving-lab/devices/shakers.git" }
+matterlab_serial_device = { git = "https://gitlab.com/aspuru-guzik-group/self-driving-lab/devices/serial-device.git" }
