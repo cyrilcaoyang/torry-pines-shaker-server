@@ -36,10 +36,8 @@ Control (gated by `X-Claim-Token` when `enforce_claims=true`):
 | `POST /control/shake/start` | `{speed_level, temperature_c, duration_s, wait_for_temperature?}` | Server times `duration_s` and stops the motor. HTTP 412 when `wait_for_temperature=true` and the setpoint is not reached within the configured timeout. |
 | `POST /control/shake/stop` | &mdash; | Idempotent; cancels watchdog, drops speed to 0. |
 
-`equipment_kind` is `"other"` because the closed v1.1 enum has no
-`"shaker"` entry yet; `details["device_subtype"] = "shaker"` carries
-the intent. Promoting `"shaker"` into the contract is a follow-up PR
-against `ac-organic-lab`.
+`equipment_kind` is `"shaker"` (added to the v1.1 enum in
+`ac-organic-lab/docs/STATUS_SPEC.md` alongside this server).
 
 ## Recipe v2 §3.5 mapping
 

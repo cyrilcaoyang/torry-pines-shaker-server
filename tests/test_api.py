@@ -41,8 +41,7 @@ def test_status_dry_run_envelope(unclaimed_client: TestClient) -> None:
     assert r.status_code == 200
     s = r.json()
     assert s["protocol_version"] == "1.1"
-    assert s["equipment_kind"] == "other"
-    assert s["details"]["device_subtype"] == "shaker"
+    assert s["equipment_kind"] == "shaker"
     # Lifespan auto-connect succeeds in dry-run -> kind is reported as
     # `dry_run`, not `requires_init`.
     assert s["equipment_status"] == "dry_run"

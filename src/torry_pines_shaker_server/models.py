@@ -11,12 +11,7 @@ package is published; once it is, replace this file with::
     )
 
 Conformance: torry-pines-shaker-server conforms to lab status spec v1.1.
-
-Note: ``equipment_kind = "other"`` is used because the closed
-``EquipmentKind`` enum in v1.1 has no ``"shaker"`` entry yet. The
-intent is signalled in ``details["device_subtype"] = "shaker"``.
-Promoting ``"shaker"`` into the contract is a follow-up PR against
-``ac-organic-lab/docs/STATUS_SPEC.md`` and the SDK ``models.py``.
+``equipment_kind = "shaker"`` is part of the v1.1 enum.
 """
 
 from __future__ import annotations
@@ -40,6 +35,7 @@ EquipmentKind = Literal[
     "plate_reader",
     "plate_sealer",
     "plate_stacker",
+    "shaker",
     "camera",
     "smart_plug",
     "power_strip",

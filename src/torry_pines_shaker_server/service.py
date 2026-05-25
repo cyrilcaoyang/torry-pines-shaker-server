@@ -183,13 +183,10 @@ class ShakerService:
         self.equipment_name: str = _config.get(
             "dashboard", "equipment_name", "Torrey Pines Shaker"
         )
-        # No "shaker" kind in STATUS_SPEC v1.1's closed enum yet;
-        # see models.py for the rationale.
-        self.equipment_kind = "other"
+        self.equipment_kind = "shaker"
         self.equipment_version: str | None = _config.get(
             "dashboard", "equipment_version", None
         )
-        self._device_subtype = "shaker"
 
     # ---- lifecycle ---------------------------------------------------------
 
@@ -506,11 +503,11 @@ class ShakerService:
                 device_time=now,
                 uptime_seconds=uptime,
                 last_error=self._last_error,
-                details={"device_subtype": self._device_subtype},
+                details={},
             )
 
         metrics: dict[str, MetricValue] = {}
-        details: dict[str, Any] = {"device_subtype": self._device_subtype}
+        details: dict[str, Any] = {}
         readback_errors: list[str] = []
 
         def _read(label: str, fn: Callable[[], Any]) -> Any:
