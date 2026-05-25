@@ -642,7 +642,7 @@ class ShakerService:
     def clear_last_error_on_success(self) -> None:
         """Drop ``self._last_error`` after a 2xx operational response.
 
-        Policy mirrors STATUS_SPEC §6.4 (also see agilent_plateloc):
+        Policy mirrors STATUS_SPEC §6.4:
         clear on first 2xx from any operational ``/control/*`` endpoint;
         do not clear from ``/control/{claim,heartbeat,release}`` or
         from reads.

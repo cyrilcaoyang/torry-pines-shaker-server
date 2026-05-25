@@ -137,7 +137,23 @@ workarounds once upstream ships fixes.
   speed (`m`), and target (`s`) queries all respond normally.
   Aggregator pins `equipment_status` to `degraded` until the RTD
   calibration table on the controller is re-flashed via the Torrey
-  Pines panel procedure.
+  Pines panel procedure. The motor side is healthy and an
+  end-to-end 2 s shake (`shake.start` &rarr; server-owned watchdog
+  &rarr; motor stop) is verified against real hardware.
+
+## Operational notes
+
+- **`/status` holds the service lock across ~4 serial round-trips**
+  (~1.7 s on this controller). Under the dashboard's 2&ndash;3 s
+  poll cadence this saturates the lock and starves concurrent
+  `/control/*` calls &mdash; new sockets pile up in `CloseWait`
+  faster than the worker drains them. Two cheap mitigations when
+  this is next touched:
+  1. Drop the redundant `idle` read in `_build_status`
+     (`get_target_temperature` already polls `s` and infers idle).
+  2. Snapshot the driver under the lock, then read off-lock.
+     `/status` is contracted as side-effect-free; it shouldn't be
+     able to block `/control/*`.
 
 ## Watchdog contract
 
