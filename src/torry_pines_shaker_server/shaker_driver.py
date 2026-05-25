@@ -68,17 +68,43 @@ class TorreyPinesShakerFacade:
     ) -> None:
         # Imported lazily so a dry-run service does not require pyserial /
         # the vendor package to be importable on macOS / CI.
+        from matterlab_shakers.base_shaker import Shaker as _BaseShaker
         from matterlab_shakers.torrey_pines_shakers import TorreyPinesShaker
 
+        # Vendor bug: TorreyPinesShaker.__init__ passes errors=… to
+        # Shaker.__init__, which doesn't accept it — but `temp`/`speed`
+        # later read self.errors. Idempotent patch: accept errors= and
+        # store it on the instance.
+        if not getattr(_BaseShaker.__init__, "_absorbs_errors", False):
+            _orig = _BaseShaker.__init__
+
+            def _patched(self, *args, errors=None, **kw):  # noqa: ANN001
+                _orig(self, *args, **kw)
+                self.errors = errors if errors is not None else {}
+
+            _patched._absorbs_errors = True  # type: ignore[attr-defined]
+            _BaseShaker.__init__ = _patched  # type: ignore[assignment]
+
         self.com_port = com_port
+        # Vendor TorreyPinesShaker.connect() references a non-existent
+        # attribute `device_serial_number` (the property is named
+        # `serial_number`). Skip vendor connect_hardware and verify
+        # via the correctly-named properties below.
         self._shaker = TorreyPinesShaker(
             com_port=com_port,
             max_temp=max_temp_c,
             min_temp=min_temp_c,
             baudrate=baudrate,
             timeout=timeout,
-            connect_hardware=True,
+            connect_hardware=False,
         )
+        model = str(self._shaker.device_model)
+        serial = str(self._shaker.serial_number)
+        if not model or not serial:
+            raise ConnectionError(
+                f"Query shaker failed on {com_port}; "
+                f"model={model!r} serial={serial!r}"
+            )
         # Cache identity reads; they're stable for the lifetime of the
         # process and the vendor driver makes a serial round-trip every
         # call.

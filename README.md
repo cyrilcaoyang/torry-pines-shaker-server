@@ -104,6 +104,41 @@ uv run --extra dev pytest -q
 
 All tests use `dry_run=True` so no hardware is required.
 
+## Vendor driver workarounds
+
+`matterlab_shakers.TorreyPinesShaker` (pulled via `tool.uv.sources`
+from the Matter Lab `shakers` GitLab repo at the time of writing)
+has three bugs that block real-hardware instantiation. All three are
+worked around in
+`src/torry_pines_shaker_server/shaker_driver.py` &mdash; remove the
+workarounds once upstream ships fixes.
+
+1. **`TorreyPinesShaker.__init__` passes `errors=` to
+   `Shaker.__init__`, which doesn't accept it.** Result:
+   `TypeError: Shaker.__init__() got an unexpected keyword argument 'errors'`.
+   *Workaround:* idempotent monkeypatch of
+   `matterlab_shakers.base_shaker.Shaker.__init__` to absorb
+   `errors=` and persist it as `self.errors`.
+2. **`self.errors` is never set on the instance**, even though
+   `TorreyPinesShaker.temp` / `.speed` read it.
+   *Same monkeypatch fixes this* (stores `errors` on `self`).
+3. **`TorreyPinesShaker.connect()` references
+   `self.device_serial_number`**, but the property is named
+   `serial_number`. Result:
+   `AttributeError: 'TorreyPinesShaker' object has no attribute 'device_serial_number'`.
+   *Workaround:* facade passes `connect_hardware=False` and verifies
+   the device by reading `device_model` / `serial_number` directly.
+
+## Hardware notes
+
+- **SC25XR v6.1, serial 50014748:** the controller returns `cal3`
+  (*"High Point Measured Cal Value is Lower than Low Point Measured
+  Value"*) to every `p` (read-temperature) query. Model, serial,
+  speed (`m`), and target (`s`) queries all respond normally.
+  Aggregator pins `equipment_status` to `degraded` until the RTD
+  calibration table on the controller is re-flashed via the Torrey
+  Pines panel procedure.
+
 ## Watchdog contract
 
 Per recipe v2 §3.5, the device server &mdash; not the workflow &mdash;
