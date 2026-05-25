@@ -475,20 +475,73 @@ class ShakerService:
     # ---- status (side-effect-free) -----------------------------------------
 
     async def get_status(self) -> EquipmentStatus:
-        """Produce a fresh status snapshot. MUST NOT mutate hardware state."""
+        """Produce a fresh status snapshot. MUST NOT mutate hardware state.
+
+        The service lock is held only briefly, to snapshot in-memory
+        cycle state and capture a driver reference. The (potentially
+        slow) serial reads then run outside the lock, off the event
+        loop, so a poll cannot starve concurrent ``/control/*`` calls
+        when the controller is slow to answer (e.g. an RTD ``cal3``
+        timeout on each temperature query).
+        """
+        # Snapshot in-memory state under the lock.
         async with self._lock:
-            status = self._build_status()
+            driver = self._driver
+            busy = self._busy
+            cycle_ends_at = self._cycle_ends_at
+            cycle_duration_s = self._cycle_duration_s
+            cycle_speed_level = self._cycle_speed_level
+            cycle_target_c = self._cycle_target_c
+            last_error = self._last_error
+
+        # Serial reads outside the lock, on a worker thread so the
+        # event loop stays responsive. A concurrent control write may
+        # interleave; vendor @open_close serialises at the serial-port
+        # layer, and any racing read surfaces as a readback_errors entry
+        # (-> equipment_status="degraded") rather than blocking the
+        # poller.
+        if driver is None:
+            readings: dict[str, Any] = {}
+            readback_errors: list[str] = []
+        else:
+            readings, readback_errors = await asyncio.to_thread(
+                _read_driver_metrics, driver
+            )
+
+        status = self._compose_status(
+            driver_present=driver is not None,
+            busy=busy,
+            cycle_ends_at=cycle_ends_at,
+            cycle_duration_s=cycle_duration_s,
+            cycle_speed_level=cycle_speed_level,
+            cycle_target_c=cycle_target_c,
+            last_error=last_error,
+            readings=readings,
+            readback_errors=readback_errors,
+        )
         claimed_by = await self.claims.current()
         if claimed_by is not None:
             status.details["claimed_by"] = claimed_by.model_dump(mode="json")
         return status
 
-    def _build_status(self) -> EquipmentStatus:
+    def _compose_status(
+        self,
+        *,
+        driver_present: bool,
+        busy: bool,
+        cycle_ends_at: datetime | None,
+        cycle_duration_s: float | None,
+        cycle_speed_level: int | None,
+        cycle_target_c: float | None,
+        last_error: ErrorInfo | None,
+        readings: dict[str, Any],
+        readback_errors: list[str],
+    ) -> EquipmentStatus:
         now = datetime.now(timezone.utc)
         uptime = time.monotonic() - self._started_at
         host = socket.gethostname()
 
-        if self._driver is None:
+        if not driver_present:
             return EquipmentStatus(
                 protocol_version=PROTOCOL_VERSION,
                 equipment_id=self.equipment_id,
@@ -502,73 +555,58 @@ class ShakerService:
                 allowed_actions=list(_ALLOWED_ACTIONS_BY_STATE["requires_init"]),
                 device_time=now,
                 uptime_seconds=uptime,
-                last_error=self._last_error,
+                last_error=last_error,
                 details={},
             )
 
         metrics: dict[str, MetricValue] = {}
         details: dict[str, Any] = {}
-        readback_errors: list[str] = []
 
-        def _read(label: str, fn: Callable[[], Any]) -> Any:
-            try:
-                return fn()
-            except Exception as exc:
-                readback_errors.append(f"{label}: {exc}")
-                return None
-
-        actual_temp = _read("actual_temperature", self._driver.get_actual_temperature)
+        actual_temp = readings.get("actual_temperature")
         if actual_temp is not None:
             metrics["actual_temperature"] = MetricValue(
                 value=actual_temp, unit="C", timestamp=now
             )
-        target_temp = _read("setpoint_temperature", self._driver.get_target_temperature)
+        target_temp = readings.get("setpoint_temperature")
         if target_temp is not None:
             metrics["setpoint_temperature"] = MetricValue(
                 value=target_temp, unit="C", timestamp=now
             )
-        speed = _read("speed_level", self._driver.get_speed)
+        speed = readings.get("speed_level")
         if speed is not None:
             metrics["speed_level"] = MetricValue(value=speed, unit="level")
-        idle = _read("idle", self._driver.get_idle)
 
-        try:
-            model = self._driver.get_device_model()
-            if model:
-                details["device_model"] = model
-        except Exception:
-            pass
-        try:
-            serial_no = self._driver.get_serial_number()
-            if serial_no:
-                details["serial_number"] = serial_no
-        except Exception:
-            pass
-        com_port = getattr(self._driver, "com_port", None)
+        model = readings.get("device_model")
+        if model:
+            details["device_model"] = model
+        serial_no = readings.get("serial_number")
+        if serial_no:
+            details["serial_number"] = serial_no
+        com_port = readings.get("com_port")
         if com_port:
             details["com_port"] = com_port
 
         # Cycle metadata (only meaningful while busy)
-        if self._cycle_ends_at is not None:
-            details["cycle_ends_at"] = self._cycle_ends_at.isoformat()
-            remaining = (self._cycle_ends_at - now).total_seconds()
+        if cycle_ends_at is not None:
+            details["cycle_ends_at"] = cycle_ends_at.isoformat()
+            remaining = (cycle_ends_at - now).total_seconds()
             metrics["remaining_seconds"] = MetricValue(
                 value=max(0.0, round(remaining, 1)), unit="s"
             )
-        if self._cycle_duration_s is not None:
-            details["cycle_duration_s"] = self._cycle_duration_s
-        if self._cycle_speed_level is not None:
-            details["cycle_speed_level"] = self._cycle_speed_level
-        if self._cycle_target_c is not None:
-            details["cycle_target_c"] = self._cycle_target_c
+        if cycle_duration_s is not None:
+            details["cycle_duration_s"] = cycle_duration_s
+        if cycle_speed_level is not None:
+            details["cycle_speed_level"] = cycle_speed_level
+        if cycle_target_c is not None:
+            details["cycle_target_c"] = cycle_target_c
 
         details["temperature_tolerance_c"] = self._temp_tolerance_c
 
-        # Components
-        motor_state: str
-        if self._busy:
-            motor_state = "running"
-        elif idle is False and speed and speed > 0:
+        # Components. The service always pairs `speed > 0` with
+        # `idle=False` at start_shake, and `speed=0` with `idle=True`
+        # at stop/watchdog, so motor state is fully derivable from
+        # `_busy` and `speed` — no extra `get_idle` serial round-trip.
+        if busy or (speed is not None and speed > 0):
             motor_state = "running"
         else:
             motor_state = "idle"
@@ -585,25 +623,25 @@ class ShakerService:
         if self.dry_run:
             state: str = "dry_run"
             details["dry_run"] = True
-            if self._busy:
+            if busy:
                 message: str | None = (
-                    f"[dry-run] shaking at level {self._cycle_speed_level} "
-                    f"toward {self._cycle_target_c} C"
+                    f"[dry-run] shaking at level {cycle_speed_level} "
+                    f"toward {cycle_target_c} C"
                 )
             else:
                 message = "Dry-run mode - no hardware connected"
-        elif self._busy:
+        elif busy:
             state = "busy"
             message = (
-                f"Shaking at level {self._cycle_speed_level} "
-                f"toward {self._cycle_target_c} C"
+                f"Shaking at level {cycle_speed_level} "
+                f"toward {cycle_target_c} C"
             )
-        elif self._last_error is not None and (
-            (now - self._last_error.timestamp).total_seconds()
+        elif last_error is not None and (
+            (now - last_error.timestamp).total_seconds()
             < _RECENT_ERROR_WINDOW_S
         ):
             state = "error"
-            message = self._last_error.message
+            message = last_error.message
         elif readback_errors:
             state = "degraded"
             message = "; ".join(readback_errors)
@@ -614,7 +652,7 @@ class ShakerService:
         # In dry_run mode, advertise the busy set while a cycle is
         # active so an operator UI doesn't show "shake.start" against
         # an already-running simulated cycle.
-        if state == "dry_run" and self._busy:
+        if state == "dry_run" and busy:
             allowed = list(_ALLOWED_ACTIONS_BY_STATE["busy"])
         else:
             allowed = list(_ALLOWED_ACTIONS_BY_STATE.get(state, []))
@@ -633,7 +671,7 @@ class ShakerService:
             uptime_seconds=uptime,
             components=components,
             metrics=metrics,
-            last_error=self._last_error,
+            last_error=last_error,
             details=details,
         )
 
@@ -673,6 +711,43 @@ class ShakerService:
             except Exception as exc:
                 self._record_error(exc, name)
                 raise
+
+
+_READ_LABELS = (
+    ("actual_temperature", "get_actual_temperature"),
+    ("setpoint_temperature", "get_target_temperature"),
+    ("speed_level", "get_speed"),
+)
+
+
+def _read_driver_metrics(
+    driver: Any,
+) -> tuple[dict[str, Any], list[str]]:
+    """Read live driver values for the status snapshot.
+
+    Runs on a worker thread (``asyncio.to_thread``) so blocking serial
+    transactions don't stall the event loop. Each read is independently
+    try/except'd: a failed read shows up in ``readback_errors`` (driving
+    ``equipment_status="degraded"``) but does not abort the snapshot.
+    """
+    readings: dict[str, Any] = {}
+    readback_errors: list[str] = []
+    for label, attr in _READ_LABELS:
+        try:
+            readings[label] = getattr(driver, attr)()
+        except Exception as exc:
+            readback_errors.append(f"{label}: {exc}")
+    for attr in ("get_device_model", "get_serial_number"):
+        try:
+            value = getattr(driver, attr)()
+        except Exception:
+            continue
+        if value:
+            readings[attr.removeprefix("get_")] = value
+    com_port = getattr(driver, "com_port", None)
+    if com_port:
+        readings["com_port"] = com_port
+    return readings, readback_errors
 
 
 def _heater_state(
