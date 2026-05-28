@@ -31,6 +31,10 @@ temperature_tolerance_c = 1.0           # +/- C considered "at setpoint" for the
                                         # wait_for_temperature precondition.
 wait_for_temperature_timeout_s = 1800.0 # Cap on how long /control/shake/start
                                         # waits for the heater before 412.
+status_readings_ttl_s = 1.0             # /status caches its 3 serial reads for
+                                        # this long. Concurrent pollers inside
+                                        # the window share one round-trip; set
+                                        # to 0 to disable (every poll hits COM).
 
 # -- Dashboard identity ------------------------------------------------------
 # Reported in GET /status. Must match the entry in the dashboard's

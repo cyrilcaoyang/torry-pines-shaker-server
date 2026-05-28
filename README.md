@@ -104,56 +104,41 @@ uv run --extra dev pytest -q
 
 All tests use `dry_run=True` so no hardware is required.
 
-## Vendor driver workarounds
-
-`matterlab_shakers.TorreyPinesShaker` (pulled via `tool.uv.sources`
-from the Matter Lab `shakers` GitLab repo at the time of writing)
-has three bugs that block real-hardware instantiation. All three are
-worked around in
-`src/torry_pines_shaker_server/shaker_driver.py` &mdash; remove the
-workarounds once upstream ships fixes.
-
-1. **`TorreyPinesShaker.__init__` passes `errors=` to
-   `Shaker.__init__`, which doesn't accept it.** Result:
-   `TypeError: Shaker.__init__() got an unexpected keyword argument 'errors'`.
-   *Workaround:* idempotent monkeypatch of
-   `matterlab_shakers.base_shaker.Shaker.__init__` to absorb
-   `errors=` and persist it as `self.errors`.
-2. **`self.errors` is never set on the instance**, even though
-   `TorreyPinesShaker.temp` / `.speed` read it.
-   *Same monkeypatch fixes this* (stores `errors` on `self`).
-3. **`TorreyPinesShaker.connect()` references
-   `self.device_serial_number`**, but the property is named
-   `serial_number`. Result:
-   `AttributeError: 'TorreyPinesShaker' object has no attribute 'device_serial_number'`.
-   *Workaround:* facade passes `connect_hardware=False` and verifies
-   the device by reading `device_model` / `serial_number` directly.
-
 ## Hardware notes
 
-- **SC25XR v6.1, serial 50014748:** the controller returns `cal3`
-  (*"High Point Measured Cal Value is Lower than Low Point Measured
-  Value"*) to every `p` (read-temperature) query. Model, serial,
-  speed (`m`), and target (`s`) queries all respond normally.
-  Aggregator pins `equipment_status` to `degraded` until the RTD
-  calibration table on the controller is re-flashed via the Torrey
-  Pines panel procedure. The motor side is healthy and an
-  end-to-end 2 s shake (`shake.start` &rarr; server-owned watchdog
-  &rarr; motor stop) is verified against real hardware.
+- **SC25XR v6.1, serial 50014748:** if the controller starts
+  returning `cal3` (*"High Point Measured Cal Value is Lower than
+  Low Point Measured Value"*) to `p` (read-temperature) queries,
+  the RTD calibration table needs to be re-flashed via the Torrey
+  Pines front-panel procedure. Model, serial, speed (`m`), and
+  target (`s`) queries are unaffected. A failed temperature read
+  surfaces as `readback_errors` &rarr; `equipment_status="degraded"`
+  in the spec envelope; the motor side stays usable.
 
-## Operational notes
+## Concurrency
 
-- **`/status` holds the service lock across ~4 serial round-trips**
-  (~1.7 s on this controller). Under the dashboard's 2&ndash;3 s
-  poll cadence this saturates the lock and starves concurrent
-  `/control/*` calls &mdash; new sockets pile up in `CloseWait`
-  faster than the worker drains them. Two cheap mitigations when
-  this is next touched:
-  1. Drop the redundant `idle` read in `_build_status`
-     (`get_target_temperature` already polls `s` and infers idle).
-  2. Snapshot the driver under the lock, then read off-lock.
-     `/status` is contracted as side-effect-free; it shouldn't be
-     able to block `/control/*`.
+`/status` is hit by the dashboard aggregator every 2&ndash;3 s while
+`/control/*` calls arrive on demand. The service keeps three
+independent mechanisms so the two surfaces don't fight at the COM
+port:
+
+1. **State lock vs. I/O lock.** `self._lock` protects in-memory
+   bookkeeping (driver presence, cycle fields, `last_error`); it is
+   never held across a serial transaction. `self._io_lock` wraps
+   every COM round-trip. Lock order is always state &rarr; io, and
+   `get_status` releases the state lock before doing any I/O &mdash;
+   so a slow read can't starve a concurrent `/control/*` from
+   acquiring state. Without the I/O lock, the vendor `@open_close`
+   decorator returns EACCES under concurrent opens on Windows.
+2. **Short-TTL readings cache.** `_get_readings_cached` memoises
+   the 3-read snapshot for `status_readings_ttl_s` (default 1.0 s,
+   config: `[service].status_readings_ttl_s`). A burst of N polls
+   inside the TTL window incurs at most one serial round-trip;
+   concurrent callers coalesce on `_readings_refresh_lock`.
+3. **Driver swap invalidates the cache.** `shutdown` clears the
+   readings cache so a subsequent `startup` against a different
+   physical unit doesn't return stale `device_model`/
+   `serial_number`/`com_port` values.
 
 ## Watchdog contract
 

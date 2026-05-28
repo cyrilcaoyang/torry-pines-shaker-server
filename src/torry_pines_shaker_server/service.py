@@ -136,9 +136,21 @@ class ShakerService:
     """Wraps a Torrey Pines shaker driver and produces spec-compliant
     :class:`EquipmentStatus` snapshots.
 
-    Concurrency: all driver I/O happens inside ``self._lock``. The
-    watchdog timer takes the same lock when it fires so it cannot
-    interleave with an in-flight ``/control/*`` call.
+    Concurrency uses two locks:
+
+    * ``self._lock`` — state lock. Protects in-memory bookkeeping
+      (driver presence, cycle fields, last_error). Never held across a
+      slow serial transaction.
+    * ``self._io_lock`` — serial-port lock. Held around every COM
+      transaction. Windows COM ports don't queue concurrent opens
+      gracefully — vendor ``@open_close`` returns EACCES under
+      contention — so racing reads (e.g. dashboard polls overlapping
+      with /control/* writes) must be serialised here.
+
+    Lock ordering is always state -> io. ``get_status`` only takes the
+    state lock briefly (to snapshot in-memory fields) and then runs
+    its serial reads under io alone; that way a slow read can't
+    starve a concurrent /control/* call from acquiring state.
     """
 
     def __init__(
@@ -153,8 +165,19 @@ class ShakerService:
         self._driver_factory = driver_factory
         self._driver: Any | None = None
         self._lock = asyncio.Lock()
+        self._io_lock = asyncio.Lock()
         self._started_at = time.monotonic()
         self._last_error: ErrorInfo | None = None
+
+        # Short-TTL cache for the serial metric reads in get_status.
+        # Under the dashboard's 2-3 s poll cadence with multiple
+        # connections, concurrent /status calls would each wait their
+        # turn on _io_lock and add 1.7 s of serial reads to the queue.
+        # With the cache, N concurrent polls within the TTL window
+        # share one serial round-trip; the rest return from memory.
+        self._readings_cache: tuple[dict[str, Any], list[str]] | None = None
+        self._readings_cache_at: float | None = None  # time.monotonic
+        self._readings_refresh_lock = asyncio.Lock()
 
         # Shake-cycle state. ``_busy`` mirrors "motor engaged"; the
         # other fields are set/cleared together with ``_watchdog_task``.
@@ -175,6 +198,9 @@ class ShakerService:
         )
         self._wait_for_temp_timeout_s: float = float(
             _config.get("service", "wait_for_temperature_timeout_s", 1800.0)
+        )
+        self._readings_ttl_s: float = float(
+            _config.get("service", "status_readings_ttl_s", 1.0)
         )
 
         self.equipment_id: str = _config.get(
@@ -214,7 +240,7 @@ class ShakerService:
             if self._driver is not None:
                 return
             try:
-                driver = await asyncio.to_thread(self._create_driver)
+                driver = await self._io(self._create_driver)
             except Exception as exc:
                 self._record_error(exc, "startup")
                 raise
@@ -234,17 +260,18 @@ class ShakerService:
                 return
             if self.watchdog_stop_on_exit:
                 try:
-                    await asyncio.to_thread(self._driver.set_speed, 0)
-                    await asyncio.to_thread(self._driver.set_idle, True)
+                    await self._io(self._driver.set_speed, 0)
+                    await self._io(self._driver.set_idle, True)
                 except Exception:
                     logger.exception("Watchdog: failed to stop motor on shutdown")
             try:
-                await asyncio.to_thread(self._driver.close)
+                await self._io(self._driver.close)
             except Exception:
                 logger.exception("Error while closing driver")
             finally:
                 self._driver = None
                 self._reset_cycle_state_locked()
+                self._invalidate_readings_cache()
 
     # ---- control -----------------------------------------------------------
 
@@ -308,7 +335,7 @@ class ShakerService:
             # Set the heater setpoint up front so the optional
             # temperature wait below sees the right target.
             try:
-                await asyncio.to_thread(self._driver.set_temperature, float(temperature_c))
+                await self._io(self._driver.set_temperature, float(temperature_c))
             except Exception as exc:
                 self._record_error(exc, "set_temperature")
                 raise
@@ -328,14 +355,14 @@ class ShakerService:
             try:
                 # The vendor driver requires speed > 0 AND idle=False
                 # to actually move the orbital head.
-                await asyncio.to_thread(self._driver.set_idle, False)
-                await asyncio.to_thread(self._driver.set_speed, int(speed_level))
+                await self._io(self._driver.set_idle, False)
+                await self._io(self._driver.set_speed, int(speed_level))
             except Exception as exc:
                 self._record_error(exc, "start_shake")
                 # Best-effort: leave the head stopped if we failed to engage.
                 try:
-                    await asyncio.to_thread(self._driver.set_speed, 0)
-                    await asyncio.to_thread(self._driver.set_idle, True)
+                    await self._io(self._driver.set_speed, 0)
+                    await self._io(self._driver.set_idle, True)
                 except Exception:
                     pass
                 raise
@@ -371,8 +398,8 @@ class ShakerService:
                     "Shaker is not connected. POST /control/startup first."
                 )
             try:
-                await asyncio.to_thread(self._driver.set_speed, 0)
-                await asyncio.to_thread(self._driver.set_idle, True)
+                await self._io(self._driver.set_speed, 0)
+                await self._io(self._driver.set_idle, True)
             except Exception as exc:
                 self._record_error(exc, "stop_shake")
                 raise
@@ -397,8 +424,8 @@ class ShakerService:
                 if self._driver is None or not self._busy:
                     return
                 try:
-                    await asyncio.to_thread(self._driver.set_speed, 0)
-                    await asyncio.to_thread(self._driver.set_idle, True)
+                    await self._io(self._driver.set_speed, 0)
+                    await self._io(self._driver.set_idle, True)
                 except Exception as exc:
                     self._record_error(exc, "watchdog_stop")
                     return
@@ -455,7 +482,7 @@ class ShakerService:
                     raise RuntimeError("Shaker disconnected during temperature wait")
                 try:
                     last_actual = float(
-                        await asyncio.to_thread(self._driver.get_actual_temperature)
+                        await self._io(self._driver.get_actual_temperature)
                     )
                 except Exception as exc:
                     self._record_error(exc, "wait_for_temperature")
@@ -494,19 +521,20 @@ class ShakerService:
             cycle_target_c = self._cycle_target_c
             last_error = self._last_error
 
-        # Serial reads outside the lock, on a worker thread so the
-        # event loop stays responsive. A concurrent control write may
-        # interleave; vendor @open_close serialises at the serial-port
-        # layer, and any racing read surfaces as a readback_errors entry
-        # (-> equipment_status="degraded") rather than blocking the
-        # poller.
+        # Serial reads outside the state lock, on a worker thread so
+        # the event loop stays responsive. They take ``self._io_lock``
+        # so two overlapping /status polls (or a poll racing a
+        # /control/* write) queue at the COM port instead of all
+        # opening the handle at once — Windows otherwise returns EACCES
+        # under contention and we'd report a spurious "degraded".
+        # Coalesced through a short-TTL cache so concurrent pollers
+        # share a single serial round-trip rather than each blocking
+        # the io_lock in turn.
         if driver is None:
             readings: dict[str, Any] = {}
             readback_errors: list[str] = []
         else:
-            readings, readback_errors = await asyncio.to_thread(
-                _read_driver_metrics, driver
-            )
+            readings, readback_errors = await self._get_readings_cached(driver)
 
         status = self._compose_status(
             driver_present=driver is not None,
@@ -707,10 +735,52 @@ class ShakerService:
                     "Shaker is not connected. POST /control/startup first."
                 )
             try:
-                await asyncio.to_thread(fn, self._driver)
+                await self._io(fn, self._driver)
             except Exception as exc:
                 self._record_error(exc, name)
                 raise
+
+    async def _io(self, fn: Callable[..., Any], *args: Any) -> Any:
+        """Run a synchronous serial-I/O callable under ``self._io_lock``
+        on a worker thread.
+
+        Centralises the io_lock + ``asyncio.to_thread`` pattern so every
+        serial transaction in the service is serialised at the COM-port
+        layer. The caller is responsible for any state-lock requirements.
+        """
+        async with self._io_lock:
+            return await asyncio.to_thread(fn, *args)
+
+    async def _get_readings_cached(
+        self, driver: Any
+    ) -> tuple[dict[str, Any], list[str]]:
+        """Return ``_read_driver_metrics(driver)`` results, cached for
+        ``self._readings_ttl_s`` seconds.
+
+        Concurrent pollers that arrive while a refresh is in flight
+        wait on ``_readings_refresh_lock`` and then re-read the cache,
+        so a burst of N polls within the TTL window incurs at most one
+        serial round-trip — not N.
+        """
+        ttl = self._readings_ttl_s
+        if ttl > 0.0 and self._readings_cache_at is not None:
+            if (time.monotonic() - self._readings_cache_at) < ttl:
+                return self._readings_cache  # type: ignore[return-value]
+
+        async with self._readings_refresh_lock:
+            # Re-check after acquiring the lock: a previous waiter may
+            # have just refreshed the cache.
+            if ttl > 0.0 and self._readings_cache_at is not None:
+                if (time.monotonic() - self._readings_cache_at) < ttl:
+                    return self._readings_cache  # type: ignore[return-value]
+            result = await self._io(_read_driver_metrics, driver)
+            self._readings_cache = result
+            self._readings_cache_at = time.monotonic()
+            return result
+
+    def _invalidate_readings_cache(self) -> None:
+        self._readings_cache = None
+        self._readings_cache_at = None
 
 
 _READ_LABELS = (
