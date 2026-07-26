@@ -18,7 +18,7 @@ def test_probe(unclaimed_client: TestClient) -> None:
     assert r.status_code == 200
     body = r.json()
     assert body["equipment_id"] == "torry_pines_shaker"
-    assert body["protocol_version"] == "1.1"
+    assert body["protocol_version"] == "1.2"
 
 
 def test_health(unclaimed_client: TestClient) -> None:
@@ -40,14 +40,21 @@ def test_status_dry_run_envelope(unclaimed_client: TestClient) -> None:
     r = unclaimed_client.get("/status")
     assert r.status_code == 200
     s = r.json()
-    assert s["protocol_version"] == "1.1"
+    assert s["protocol_version"] == "1.2"
     assert s["equipment_kind"] == "shaker"
     # Lifespan auto-connect succeeds in dry-run -> kind is reported as
     # `dry_run`, not `requires_init`.
     assert s["equipment_status"] == "dry_run"
-    # dry_run advertises every skill so an operator UI works in dev.
+    # v1.2: activity observed from the (stub) motor — idle at startup, with
+    # cycles_total exposed for exact accounting.
+    assert s["activity"] == "idle"
+    assert s["metrics"]["cycles_total"] == {
+        "value": 0, "unit": "count", "timestamp": None,
+    }
+    # The idle set advertises both subsystems' actions (stub is healthy).
     assert "shake.start" in s["allowed_actions"]
     assert "shake.stop" in s["allowed_actions"]
+    assert "shake.set_temperature" in s["allowed_actions"]
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,25 @@
+{
+  "protocol_version": "1.2",
+  "equipment_id": "torry_pines_shaker",
+  "equipment_name": "Torrey Pines Shaker",
+  "equipment_kind": "shaker",
+  "host": "sdl2-pc-03-cytation",
+  "equipment_status": "ready",
+  "activity": "idle",
+  "activity_since": "2026-07-25T14:00:00Z",
+  "message": "Idle, ready to shake",
+  "device_time": "2026-07-25T14:05:00Z",
+  "components": {
+    "motor":  {"connected": true, "state": "idle"},
+    "heater": {"connected": true, "state": "stable"}
+  },
+  "metrics": {
+    "actual_temperature":   {"value": 25.0, "unit": "C"},
+    "setpoint_temperature": {"value": 25.0, "unit": "C"},
+    "speed_level":          {"value": 0, "unit": "level"},
+    "cycles_total":         {"value": 12, "unit": "count"}
+  },
+  "allowed_actions": ["startup", "shutdown", "shake.stop", "shake.start", "shake.set_speed", "shake.set_temperature"],
+  "last_error": null,
+  "details": {"temperature_tolerance_c": 1.0, "claimed_by": null}
+}

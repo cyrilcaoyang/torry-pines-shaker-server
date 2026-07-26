@@ -5,10 +5,23 @@ by the `matterlab_shakers.TorreyPinesShaker` driver from the Matter Lab
 [shakers](https://gitlab.com/aspuru-guzik-group/self-driving-lab/devices/shakers)
 GitLab repo.
 
-This repo conforms to **lab status spec v1.1** (see
-`ac-organic-lab/docs/STATUS_SPEC.md`). Implements the recipe v2 §3.5
-`shake` step: the server owns the duration timer, with a watchdog that
-stops the motor on process exit.
+This repo conforms to **lab status spec v1.2** (see
+`ac-organic-lab/docs/STATUS_SPEC.md`; contract types imported from the
+shared [`sdl-lab-contract`](https://github.com/AccelerationConsortium/sdl-lab-contract)
+package). Implements the recipe v2 §3.5 `shake` step: the server owns
+the duration timer, with a watchdog that stops the motor on process
+exit.
+
+**Primary operation (spec §2.3):** the orbital motor turning. `activity`
+is observed from the motor (engaged cycle, or a nonzero speed readback)
+— `"running"` while the head turns, `"idle"` when stopped, `"unknown"`
+only when the speed register cannot be read. It is independent of
+health: a heater RTD fault mid-cycle reports `equipment_status:
+"degraded"` **and** `activity: "running"`. `activity_since` stamps the
+start of the current span; `metrics["cycles_total"]` counts ended
+cycles (watchdog completion or operator stop) monotonically until
+process restart, so readers polling slower than a cycle still see it
+happened (§2.3.1).
 
 ## Endpoints
 
@@ -31,13 +44,33 @@ Control (gated by `X-Claim-Token` when `enforce_claims=true`):
 |---|---|---|
 | `POST /control/startup` | &mdash; | Open the serial port and verify the device. |
 | `POST /control/shutdown` | &mdash; | Stop motor, close port. |
-| `POST /control/shake/set_temperature` | `{temperature_c: float}` | -20..+110 C. |
-| `POST /control/shake/set_speed` | `{speed_level: int}` | 1..9; use `/control/shake/stop` to halt. |
-| `POST /control/shake/start` | `{speed_level, temperature_c, duration_s, wait_for_temperature?}` | Server times `duration_s` and stops the motor. HTTP 412 when `wait_for_temperature=true` and the setpoint is not reached within the configured timeout. |
+| `POST /control/shake/set_temperature` | `{temperature_c: float}` | -20..+110 C. HTTP 412 while heater readbacks fail. |
+| `POST /control/shake/set_speed` | `{speed_level: int}` | 1..9; use `/control/shake/stop` to halt. HTTP 412 while the speed readback fails. |
+| `POST /control/shake/start` | `{speed_level, temperature_c, duration_s, wait_for_temperature?}` | Server times `duration_s` and stops the motor. HTTP 412 when the motor readback fails, when `wait_for_temperature=true` with a failing heater readback, or when the setpoint is not reached within the configured timeout. |
 | `POST /control/shake/stop` | &mdash; | Idempotent; cancels watchdog, drops speed to 0. |
 
 `equipment_kind` is `"shaker"` (added to the v1.1 enum in
 `ac-organic-lab/docs/STATUS_SPEC.md` alongside this server).
+
+## Precondition catalog (spec §6)
+
+Availability is decided per **subsystem**, not per coarse state, by one
+helper consulted by both `/status` (`allowed_actions`) and the
+`/control/*` 412 gates — the two surfaces cannot disagree (§6.2):
+
+| Precondition | Gates | 412 body shape |
+|---|---|---|
+| Motor speed readback failing | `shake.start`, `shake.set_speed` | `{detail, blocked_subsystem: "motor", readback_errors, retry_after_s}` |
+| Heater temperature readbacks failing | `shake.set_temperature`; `shake.start` **only** with `wait_for_temperature=true` | `{detail, blocked_subsystem: "heater", readback_errors, retry_after_s}` |
+| Recent operational error (§6.4 window) | everything except `shutdown` | `{detail, blocked_subsystem: "service", last_error_code, retry_after_s}` |
+| Setpoint not reached in time (`wait_for_temperature=true`) | `shake.start` | `{detail, actual_c, setpoint_c, tolerance_c, retry_after_s}` |
+
+Deliberate consequence: a **heater fault does not block shaking** — the
+SC25XR's chronic RTD cal fault leaves `shake.start` available (the
+motor is healthy) while withholding `shake.set_temperature`. While
+`activity == "running"`, start/set actions are withheld and
+`shake.stop` stays reachable (§2.3). Coarse state conflicts (driver not
+connected, cycle already running) remain HTTP 409, not 412.
 
 ## Recipe v2 §3.5 mapping
 
@@ -180,7 +213,8 @@ header.
 
 ## See also
 
-- `ac-organic-lab/docs/STATUS_SPEC.md` &mdash; the v1.0 + v1.1 contract.
+- `ac-organic-lab/docs/STATUS_SPEC.md` &mdash; the v1.0/v1.1/v1.2 contract.
+- [`sdl-lab-contract`](https://github.com/AccelerationConsortium/sdl-lab-contract) &mdash; the shared contract types this repo imports.
 - `ac-organic-lab/docs/INTERLOCKS.md` &mdash; four-layer safety model.
 - `ac-organic-lab/docs/DEVICE_PC_SETUP.md` &mdash; NSSM install recipe.
 - `organic-solubility/docs/RECIPE_V2.md` &mdash; the `shake` step (§3.5).

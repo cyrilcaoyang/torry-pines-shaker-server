@@ -1,0 +1,23 @@
+{
+  "protocol_version": "1.2",
+  "equipment_id": "torry_pines_shaker",
+  "equipment_name": "Torrey Pines Shaker",
+  "equipment_kind": "shaker",
+  "host": "sdl2-pc-03-cytation",
+  "equipment_status": "degraded",
+  "activity": "running",
+  "activity_since": "2026-07-25T14:20:00Z",
+  "message": "actual_temperature: High Point Measured Cal Value is Lower than Low Point Measured Value (or reverse) — shaking continues (motor healthy)",
+  "device_time": "2026-07-25T14:21:00Z",
+  "components": {
+    "motor":  {"connected": true, "state": "running"},
+    "heater": {"connected": true, "state": "unknown"}
+  },
+  "metrics": {
+    "speed_level":  {"value": 3, "unit": "level"},
+    "cycles_total": {"value": 13, "unit": "count"}
+  },
+  "allowed_actions": ["shutdown", "shake.stop"],
+  "last_error": null,
+  "details": {"cycle_duration_s": 180.0, "cycle_speed_level": 3, "cycle_target_c": 25.0, "temperature_tolerance_c": 1.0, "claimed_by": null}
+}
