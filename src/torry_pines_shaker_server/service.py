@@ -42,39 +42,68 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# allowed_actions per equipment_status (v1.1)
+# allowed_actions (v1.2) — one pure function, two independent gates
 #
-# Mirrors the inverse of the (proposed) skill catalog `requires_states`
-# for a shaker. Skill names follow the same dotted-namespace pattern as
-# the SDK catalog (``seal.start``, ``stage.in``, ...) so a future
-# ``skill_catalog/shaker.py`` can quote them verbatim.
+# Skill names follow the SDK catalog's dotted namespace verbatim
+# (``skill_catalog/shaker.py`` in ac-organic-lab). Availability is computed
+# from the *subsystem* that each action needs, not from the coarse state
+# alone — mirroring the catalog's motor/heater AND-gate split so a
+# heater-side ``degraded`` (the SC25XR's chronic RTD cal fault) does not
+# block shaking, while ``shake.set_temperature`` stays gated by the heater.
+#
+# §6.2 single-source-of-truth: this function is consulted by BOTH the
+# ``/status`` composer (via ``_compose_status``) and the ``/control/*``
+# 412 gate (via ``evaluate_action_gate``), so the advertised list and the
+# refusals can never disagree.
 # ---------------------------------------------------------------------------
 
-_ALL_SHAKER_SKILLS = [
-    "startup",
-    "shutdown",
-    "shake.start",
-    "shake.stop",
-    "shake.set_temperature",
-    "shake.set_speed",
-]
+_HEATER_READ_LABELS = ("actual_temperature:", "setpoint_temperature:")
+_MOTOR_READ_LABELS = ("speed_level:",)
 
-_ALLOWED_ACTIONS_BY_STATE: dict[str, list[str]] = {
-    "requires_init": ["startup"],
-    "ready": [
-        "startup",
-        "shutdown",
-        "shake.start",
-        "shake.set_temperature",
-        "shake.set_speed",
-    ],
-    "busy": ["shutdown", "shake.stop"],
-    "degraded": ["shutdown"],
-    "error": ["shutdown"],
-    "e_stop": [],
-    "unknown": [],
-    "dry_run": list(_ALL_SHAKER_SKILLS),
-}
+
+def _subsystems_ok(readback_errors: list[str]) -> tuple[bool, bool]:
+    """Split ``readback_errors`` (``"<label>: <exc>"`` strings from
+    ``_read_driver_metrics``) into per-subsystem health: ``(motor_ok,
+    heater_ok)``."""
+    motor_ok = not any(e.startswith(_MOTOR_READ_LABELS) for e in readback_errors)
+    heater_ok = not any(e.startswith(_HEATER_READ_LABELS) for e in readback_errors)
+    return motor_ok, heater_ok
+
+
+def _compute_allowed_actions(
+    state: str,
+    activity: str,
+    *,
+    motor_ok: bool,
+    heater_ok: bool,
+) -> list[str]:
+    """The device's authoritative "what would I honor right now" list.
+
+    Rules (STATUS_SPEC §2.3 + §6.2):
+
+    * ``requires_init`` → only ``startup``.
+    * ``error`` (recent operational failure) → only ``shutdown`` until the
+      §6.4 auto-clear or the recent-error window elapses.
+    * ``activity == "running"`` → no second concurrent run: only
+      ``shutdown`` + ``shake.stop``.
+    * otherwise, per subsystem: motor OK → ``shake.start`` /
+      ``shake.set_speed``; heater OK → ``shake.set_temperature``.
+      ``shake.stop`` stays listed (idempotent no-op — the device honors it).
+    """
+    if state == "requires_init":
+        return ["startup"]
+    if state in ("e_stop", "unknown"):
+        return []
+    if state == "error":
+        return ["shutdown"]
+    if activity == "running":
+        return ["shutdown", "shake.stop"]
+    allowed = ["startup", "shutdown", "shake.stop"]
+    if motor_ok:
+        allowed += ["shake.start", "shake.set_speed"]
+    if heater_ok:
+        allowed += ["shake.set_temperature"]
+    return allowed
 
 
 _RECENT_ERROR_WINDOW_S = 60.0
@@ -179,6 +208,21 @@ class ShakerService:
         self._readings_cache_at: float | None = None  # time.monotonic
         self._readings_refresh_lock = asyncio.Lock()
 
+        # Activity span tracking (STATUS_SPEC v1.2 §2.3). ``_activity`` is
+        # the last *observed* value (motor engaged / stopped / unreadable);
+        # ``_activity_since`` is the instant it last changed. Exact stamps
+        # come from start/stop/watchdog; ``_compose_status`` reconciles for
+        # anything they miss (e.g. a manual set_speed spinning the head).
+        self._activity: str = "unknown"
+        self._activity_since: datetime | None = None
+
+        # Monotonic count of ended shake cycles (STATUS_SPEC §2.3.1
+        # reserved metric ``cycles_total``). Increments when an engaged
+        # cycle ends — watchdog completion or operator stop — so a reader
+        # polling slower than a cycle still sees it happened. Resets on
+        # process restart, per the spec's counter semantics.
+        self._cycles_total: int = 0
+
         # Shake-cycle state. ``_busy`` mirrors "motor engaged"; the
         # other fields are set/cleared together with ``_watchdog_task``.
         self._busy: bool = False
@@ -272,6 +316,9 @@ class ShakerService:
                 self._driver = None
                 self._reset_cycle_state_locked()
                 self._invalidate_readings_cache()
+                # Disconnected hardware cannot be running under our control;
+                # §2.3 pins requires_init ⇒ idle.
+                self._note_activity("idle")
 
     # ---- control -----------------------------------------------------------
 
@@ -368,6 +415,7 @@ class ShakerService:
                 raise
 
             self._busy = True
+            self._note_activity("running")  # exact span start (§2.3)
             self._cycle_started_at = now
             self._cycle_ends_at = now + timedelta(seconds=float(duration_s))
             self._cycle_duration_s = float(duration_s)
@@ -397,6 +445,7 @@ class ShakerService:
                 raise RuntimeError(
                     "Shaker is not connected. POST /control/startup first."
                 )
+            was_busy = self._busy
             try:
                 await self._io(self._driver.set_speed, 0)
                 await self._io(self._driver.set_idle, True)
@@ -404,6 +453,9 @@ class ShakerService:
                 self._record_error(exc, "stop_shake")
                 raise
             self._reset_cycle_state_locked()
+            if was_busy:
+                self._cycles_total += 1  # operator-ended cycle still counts
+            self._note_activity("idle")
 
     # ---- watchdog ----------------------------------------------------------
 
@@ -434,6 +486,8 @@ class ShakerService:
                     duration_s,
                 )
                 self._reset_cycle_state_locked()
+                self._cycles_total += 1
+                self._note_activity("idle")
         except Exception:
             logger.exception("watchdog: unexpected failure")
 
@@ -570,6 +624,9 @@ class ShakerService:
         host = socket.gethostname()
 
         if not driver_present:
+            # §2.3 invariant: requires_init ⇒ idle (disconnected hardware
+            # cannot be running under our control).
+            self._note_activity("idle")
             return EquipmentStatus(
                 protocol_version=PROTOCOL_VERSION,
                 equipment_id=self.equipment_id,
@@ -580,7 +637,11 @@ class ShakerService:
                 equipment_status="requires_init",
                 message="Driver not connected. POST /control/startup to initialize.",
                 required_actions=["startup"],
-                allowed_actions=list(_ALLOWED_ACTIONS_BY_STATE["requires_init"]),
+                allowed_actions=_compute_allowed_actions(
+                    "requires_init", "idle", motor_ok=False, heater_ok=False
+                ),
+                activity="idle",
+                activity_since=self._activity_since,
                 device_time=now,
                 uptime_seconds=uptime,
                 last_error=last_error,
@@ -630,14 +691,21 @@ class ShakerService:
 
         details["temperature_tolerance_c"] = self._temp_tolerance_c
 
-        # Components. The service always pairs `speed > 0` with
-        # `idle=False` at start_shake, and `speed=0` with `idle=True`
-        # at stop/watchdog, so motor state is fully derivable from
-        # `_busy` and `speed` — no extra `get_idle` serial round-trip.
+        # Components + activity (§2.3: observed from the motor, never
+        # derived from equipment_status). The service always pairs
+        # `speed > 0` with `idle=False` at start_shake, and `speed=0` with
+        # `idle=True` at stop/watchdog, so motor state is fully derivable
+        # from `_busy` and `speed` — no extra `get_idle` serial round-trip.
+        # A failed speed readback with no engaged cycle means the motor
+        # genuinely cannot be observed: `unknown`, never a false `idle`.
         if busy or (speed is not None and speed > 0):
             motor_state = "running"
+        elif speed is None:
+            motor_state = "unknown"
         else:
             motor_state = "idle"
+        activity = motor_state  # same vocabulary by construction
+        self._note_activity(activity)
 
         components: dict[str, ComponentStatus] = {
             "motor": ComponentStatus(connected=True, state=motor_state),
@@ -647,7 +715,14 @@ class ShakerService:
             ),
         }
 
-        # equipment_status
+        metrics["cycles_total"] = MetricValue(value=self._cycles_total, unit="count")
+
+        motor_ok, heater_ok = _subsystems_ok(readback_errors)
+
+        # equipment_status — health first (§2.2). A running cycle no longer
+        # masks an active fault: heater RTD fault + motor mid-cycle now
+        # reports `degraded` + `activity: "running"` (the motivating case of
+        # spec §2.3), where it previously reported a bare `busy`.
         if self.dry_run:
             state: str = "dry_run"
             details["dry_run"] = True
@@ -658,12 +733,6 @@ class ShakerService:
                 )
             else:
                 message = "Dry-run mode - no hardware connected"
-        elif busy:
-            state = "busy"
-            message = (
-                f"Shaking at level {cycle_speed_level} "
-                f"toward {cycle_target_c} C"
-            )
         elif last_error is not None and (
             (now - last_error.timestamp).total_seconds()
             < _RECENT_ERROR_WINDOW_S
@@ -673,17 +742,27 @@ class ShakerService:
         elif readback_errors:
             state = "degraded"
             message = "; ".join(readback_errors)
+            if activity == "running":
+                message += " — shaking continues (motor healthy)"
+        elif activity == "running":
+            # Healthy + running ≡ `busy` (§2.3). This also covers a head
+            # spun up via set_speed outside a managed cycle, so `ready`
+            # can never co-occur with a turning motor (ready ⇒ idle).
+            state = "busy"
+            if busy:
+                message = (
+                    f"Shaking at level {cycle_speed_level} "
+                    f"toward {cycle_target_c} C"
+                )
+            else:
+                message = "Motor running (no managed cycle)"
         else:
             state = "ready"
             message = "Idle, ready to shake"
 
-        # In dry_run mode, advertise the busy set while a cycle is
-        # active so an operator UI doesn't show "shake.start" against
-        # an already-running simulated cycle.
-        if state == "dry_run" and busy:
-            allowed = list(_ALLOWED_ACTIONS_BY_STATE["busy"])
-        else:
-            allowed = list(_ALLOWED_ACTIONS_BY_STATE.get(state, []))
+        allowed = _compute_allowed_actions(
+            state, activity, motor_ok=motor_ok, heater_ok=heater_ok
+        )
 
         return EquipmentStatus(
             protocol_version=PROTOCOL_VERSION,
@@ -695,6 +774,8 @@ class ShakerService:
             equipment_status=state,  # type: ignore[arg-type]
             message=message,
             allowed_actions=allowed,
+            activity=activity,  # type: ignore[arg-type]
+            activity_since=self._activity_since,
             device_time=now,
             uptime_seconds=uptime,
             components=components,
@@ -703,7 +784,94 @@ class ShakerService:
             details=details,
         )
 
+    # ---- v1.2 availability gate (§6.2 mirror of allowed_actions) -----------
+
+    async def evaluate_action_gate(
+        self,
+        action: str,
+        *,
+        wait_for_temperature: bool = False,
+    ) -> dict[str, Any] | None:
+        """Decide whether ``/control/<action>`` should be refused with 412.
+
+        Returns ``None`` when the action may proceed, else the structured
+        §6.1 body for the 412 response. Consults the SAME pure function as
+        the ``/status`` composer (``_compute_allowed_actions``), fed from
+        the same short-TTL readings cache, so the advertised
+        ``allowed_actions`` and the refusals cannot drift (§6.2).
+
+        Only per-subsystem preconditions are decided here. Coarse state
+        conflicts (driver missing, cycle already running) keep their
+        existing 409 paths in the service methods — those are state
+        conflicts, not precondition refusals.
+        """
+        async with self._lock:
+            driver = self._driver
+            busy = self._busy
+            last_error = self._last_error
+
+        if driver is None or busy:
+            return None  # the endpoint's 409 handles these
+
+        readings, readback_errors = await self._get_readings_cached(driver)
+        motor_ok, heater_ok = _subsystems_ok(readback_errors)
+
+        now = datetime.now(timezone.utc)
+        recent_error = last_error is not None and (
+            (now - last_error.timestamp).total_seconds() < _RECENT_ERROR_WINDOW_S
+        )
+        state = "error" if (not self.dry_run and recent_error) else "ready"
+        activity = "idle"  # busy was False above
+
+        allowed = _compute_allowed_actions(
+            state, activity, motor_ok=motor_ok, heater_ok=heater_ok
+        )
+        blocked = action not in allowed
+        # Per-request extra precondition: waiting for temperature needs a
+        # readable heater even though plain shake.start does not.
+        needs_heater_wait = (
+            action == "shake.start" and wait_for_temperature and not heater_ok
+        )
+        if not blocked and not needs_heater_wait:
+            return None
+
+        if state == "error":
+            return {
+                "detail": (
+                    "Recent operational error — only shutdown is available "
+                    "until it clears (§6.4)"
+                ),
+                "blocked_subsystem": "service",
+                "last_error_code": last_error.code if last_error else None,
+                "retry_after_s": _RECENT_ERROR_WINDOW_S,
+            }
+        subsystem = (
+            "heater"
+            if (action == "shake.set_temperature" or needs_heater_wait)
+            else "motor"
+        )
+        labels = _HEATER_READ_LABELS if subsystem == "heater" else _MOTOR_READ_LABELS
+        return {
+            "detail": (
+                f"{subsystem} readback failing — {action} unavailable"
+                + (" with wait_for_temperature" if needs_heater_wait else "")
+            ),
+            "blocked_subsystem": subsystem,
+            "readback_errors": [
+                e for e in readback_errors if e.startswith(labels)
+            ],
+            "retry_after_s": None,
+        }
+
     # ---- helpers -----------------------------------------------------------
+
+    def _note_activity(self, activity: str) -> None:
+        """Record an observed activity value, stamping ``activity_since``
+        at the instant the value changes (§2.3: the start of the CURRENT
+        span, not of the enclosing request or process)."""
+        if activity != self._activity:
+            self._activity = activity
+            self._activity_since = datetime.now(timezone.utc)
 
     def clear_last_error_on_success(self) -> None:
         """Drop ``self._last_error`` after a 2xx operational response.
