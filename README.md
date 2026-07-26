@@ -72,6 +72,41 @@ motor is healthy) while withholding `shake.set_temperature`. While
 `shake.stop` stays reachable (§2.3). Coarse state conflicts (driver not
 connected, cycle already running) remain HTTP 409, not 412.
 
+## `last_error.code` taxonomy (spec §6, best-practice #6)
+
+Branch on `last_error.code`, never on `last_error.message` — the codes are
+stable, the prose is not. The set is defined once as
+`service.LAST_ERROR_CODES` (a `frozenset`) and every write goes through a
+setter that validates against it, falling back to `serial_other`:
+
+| `code` | Meaning | Severity | `required_actions` |
+|---|---|---|---|
+| `serial_init_failed` | Driver failed to open the port on `startup` | `error` | — |
+| `serial_timeout` | Serial read/write timed out | `error` | — |
+| `serial_other` | Unclassified serial/driver failure | `error` | — |
+| `rtd_disconnected` | Heater RTD sensor not connected | `warning` | Reconnect the heater RTD sensor |
+| `rtd_shorted` | Heater RTD sensor shorted | `warning` | Replace the heater RTD sensor |
+| `calibration_error` | Heater RTD calibration invalid (the SC25XR's chronic `cal` fault) | `warning` | Recalibrate heater RTD |
+| `process_internal` | Bug in this service, not the hardware | `error` | — |
+
+Two sources populate `last_error`, and they are not equivalent:
+
+- **Operational failures** — an exception raised while executing a
+  `/control/*` action. Severity `error`; auto-cleared on the next 2xx from
+  an operational endpoint (§6.4). These drive `equipment_status: "error"`
+  for `_RECENT_ERROR_WINDOW_S` (60 s).
+- **Readback faults** — a metric read that fails while composing `/status`
+  (the live cal fault). Severity `warning`. These are *not* operational
+  failures — nothing was executing — so they never drive
+  `equipment_status: "error"`; §2.2 expresses them as `degraded`, and they
+  disappear on their own when the readback succeeds rather than being
+  cleared by an action. A heater fault a human must clear also populates
+  `required_actions` per the table above.
+
+An operational failure takes precedence over a concurrent readback fault,
+because §6.4 keeps it until an action succeeds. Precondition refusals (412)
+never touch `last_error` (§6.3).
+
 ## Recipe v2 §3.5 mapping
 
 A `shake` step from a Recipe v2 plan:

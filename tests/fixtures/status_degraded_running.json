@@ -8,6 +8,7 @@
   "activity": "running",
   "activity_since": "2026-07-25T14:20:00Z",
   "message": "actual_temperature: High Point Measured Cal Value is Lower than Low Point Measured Value (or reverse) — shaking continues (motor healthy)",
+  "required_actions": ["Recalibrate heater RTD"],
   "device_time": "2026-07-25T14:21:00Z",
   "components": {
     "motor":  {"connected": true, "state": "running"},
@@ -18,6 +19,11 @@
     "cycles_total": {"value": 13, "unit": "count"}
   },
   "allowed_actions": ["shutdown", "shake.stop"],
-  "last_error": null,
+  "last_error": {
+    "code": "calibration_error",
+    "message": "actual_temperature: High Point Measured Cal Value is Lower than Low Point Measured Value (or reverse)",
+    "severity": "warning",
+    "timestamp": "2026-07-25T14:21:00Z"
+  },
   "details": {"cycle_duration_s": 180.0, "cycle_speed_level": 3, "cycle_target_c": 25.0, "temperature_tolerance_c": 1.0, "claimed_by": null}
 }

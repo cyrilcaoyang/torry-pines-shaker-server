@@ -27,6 +27,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
+from . import __version__
 from . import config as _config
 from .claims import ClaimStore
 from .models import (
@@ -122,21 +123,86 @@ LAST_ERROR_CODES: frozenset[str] = frozenset(
 )
 
 
-def _classify_error(method_name: str, exc: Exception) -> str:
-    if isinstance(exc, (KeyError, AttributeError, TypeError, NameError)):
-        return "process_internal"
-    text = str(exc).lower()
+def _classify_error_text(
+    method_name: str, text: str, *, is_timeout: bool = False
+) -> str:
+    """Classify a fault from its message text (see ``LAST_ERROR_CODES``).
+
+    Split out of :func:`_classify_error` so a *readback* fault observed
+    while composing ``/status`` — which has a message but no exception
+    object — lands on the same stable taxonomy as an operational failure,
+    instead of being reported only as free text (best-practice #6).
+    """
+    text = text.lower()
     if "rtd sensor is not connected" in text:
         return "rtd_disconnected"
     if "rtd sensor has shorted" in text:
         return "rtd_shorted"
-    if "cal" in text and "out of range" in text:
+    # The SC25XR reports a failed heater calibration as "High Point Measured
+    # Cal Value is Lower than Low Point Measured Value (or reverse)" — no
+    # "out of range" anywhere in it, so matching that phrase alone dropped
+    # the live cal fault into `serial_other` and left clients string-matching
+    # `message` to recognise it.
+    if "cal" in text and (
+        "out of range" in text
+        or "point measured" in text
+        or "cal value" in text
+    ):
         return "calibration_error"
-    if isinstance(exc, TimeoutError) or "timeout" in text or "timed out" in text:
+    if is_timeout or "timeout" in text or "timed out" in text:
         return "serial_timeout"
     if method_name == "startup":
         return "serial_init_failed"
     return "serial_other"
+
+
+def _classify_error(method_name: str, exc: Exception) -> str:
+    if isinstance(exc, (KeyError, AttributeError, TypeError, NameError)):
+        return "process_internal"
+    return _classify_error_text(
+        method_name, str(exc), is_timeout=isinstance(exc, TimeoutError)
+    )
+
+
+#: Operator action that clears each heater-side fault, surfaced as
+#: ``required_actions`` so the dashboard has something to render for a fault
+#: that only a human can clear (§2.2: ``required_actions`` is the
+#: actionability carrier).
+_HEATER_FAULT_ACTIONS: dict[str, str] = {
+    "calibration_error": "Recalibrate heater RTD",
+    "rtd_disconnected": "Reconnect the heater RTD sensor",
+    "rtd_shorted": "Replace the heater RTD sensor",
+}
+
+
+def _readback_error_info(
+    readback_errors: list[str], now: datetime
+) -> ErrorInfo | None:
+    """Synthesize the envelope's ``last_error`` from an active readback fault.
+
+    A failed metric readback (the SC25XR's chronic heater RTD cal fault is
+    the live case) is a real, diagnosable fault, but it is *not* an
+    operational failure — nothing was executing. It therefore never touched
+    ``self._last_error``, and reached ``/status`` only as free text in
+    ``message`` plus ``details.readback_errors``; identifying it meant
+    string-matching ``message``, exactly what best-practice #6 warns
+    against.
+
+    Severity is ``warning``, not ``error``: §2.2 already expresses the
+    safety consequence by downgrading the top-level state to ``degraded``,
+    and a useful subset of capability remains (the motor still shakes).
+    This mirrors the reference shaker envelope in STATUS_SPEC §10.
+    """
+    if not readback_errors:
+        return None
+    # Readback strings are "<label>: <exception>" (see _read_driver_metrics).
+    _, _, detail = readback_errors[0].partition(": ")
+    return ErrorInfo(
+        code=_classify_error_text("", detail or readback_errors[0]),
+        message="; ".join(readback_errors),
+        severity="warning",
+        timestamp=now,
+    )
 
 
 class TemperatureNotReady(Exception):
@@ -254,8 +320,11 @@ class ShakerService:
             "dashboard", "equipment_name", "Torrey Pines Shaker"
         )
         self.equipment_kind = "shaker"
-        self.equipment_version: str | None = _config.get(
-            "dashboard", "equipment_version", None
+        # Fall back to the package version rather than publishing null: an
+        # unset `[dashboard] equipment_version` should not cost the dashboard
+        # the ability to tell which build a device is running.
+        self.equipment_version: str | None = (
+            _config.get("dashboard", "equipment_version", None) or __version__
         )
 
     # ---- lifecycle ---------------------------------------------------------
@@ -764,6 +833,29 @@ class ShakerService:
             state, activity, motor_ok=motor_ok, heater_ok=heater_ok
         )
 
+        # §6 diagnosis. An operational failure always wins; otherwise surface
+        # an *active* readback fault under a stable `code`.
+        #
+        # Deliberately computed AFTER the state decision above, which keys off
+        # the operational `last_error` alone: folding a readback fault into
+        # that variable would push a chronic cal fault through the `error`
+        # branch, and `_compute_allowed_actions` withholds everything but
+        # `shutdown` in `error` — silently un-shakeable hardware, destroying
+        # the per-subsystem gating this release exists for. `degraded` +
+        # `activity: "running"` is the correct reading (§2.3), and a warning
+        # here does not soften it (§2.3's prohibition on hiding a fault).
+        envelope_last_error = last_error or _readback_error_info(
+            readback_errors, now
+        )
+
+        # A heater fault only a human can clear gets an operator action; a
+        # motor readback fault does not (no single prescribed remedy).
+        required: list[str] = []
+        if not heater_ok and envelope_last_error is not None:
+            action = _HEATER_FAULT_ACTIONS.get(envelope_last_error.code or "")
+            if action is not None:
+                required = [action]
+
         return EquipmentStatus(
             protocol_version=PROTOCOL_VERSION,
             equipment_id=self.equipment_id,
@@ -773,6 +865,7 @@ class ShakerService:
             host=host,
             equipment_status=state,  # type: ignore[arg-type]
             message=message,
+            required_actions=required,
             allowed_actions=allowed,
             activity=activity,  # type: ignore[arg-type]
             activity_since=self._activity_since,
@@ -780,7 +873,7 @@ class ShakerService:
             uptime_seconds=uptime,
             components=components,
             metrics=metrics,
-            last_error=last_error,
+            last_error=envelope_last_error,
             details=details,
         )
 

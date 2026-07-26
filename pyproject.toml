@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "torry-pines-shaker-server"
-version = "0.2.0"
+version = "0.2.1"
 description = "REST API for the Torrey Pines Scientific shaker (lab status spec v1.2)"
 readme = "README.md"
 authors = [
