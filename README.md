@@ -164,6 +164,22 @@ To run as a Windows service via NSSM, follow
 `ac-organic-lab/docs/DEVICE_PC_SETUP.md` &mdash; the conventional
 service name is `torry-pines-shaker` and the port is `8030`.
 
+### Boot-time auto-connect retry
+
+At service start the app tries to connect the driver once
+(`[service].startup_connect_timeout_s`). If that fails &mdash; typically
+because the USB serial adapter enumerates *after* the service during a
+PC boot (observed 2026-07-31: the device sat in `requires_init` for two
+days) &mdash; a background task retries the connect every
+`[service].startup_retry_interval_s` seconds (default 30; `0` disables).
+
+The retry stops **permanently at the first successful connect**, whether
+its own or an operator's `POST /control/startup`. A deliberate
+`POST /control/shutdown` is therefore never fought by a lingering
+reconnect. A successful retry clears the recorded `serial_init_failed`
+from `last_error`, mirroring the §6.4 auto-clear an operator-driven
+startup gets from the API layer.
+
 ## Test
 
 ```powershell

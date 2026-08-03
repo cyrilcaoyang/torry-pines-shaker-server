@@ -20,6 +20,10 @@ port = 8030                             # HTTP port
 dry_run = false                         # true = in-memory stub, no hardware
 cors_origins = ["*"]                    # Tailnet ACLs gate access
 startup_connect_timeout_s = 10.0        # Auto-connect timeout at service start
+startup_retry_interval_s = 30.0         # Retry a failed auto-connect every N s
+                                        # until the first successful connect
+                                        # (USB serial can enumerate after the
+                                        # service at boot). 0 disables retries.
 enforce_claims = true                   # v1.1: require X-Claim-Token on /control/*
                                         #   true  = strict (recommended in production)
                                         #   false = advisory (publishes claimed_by but

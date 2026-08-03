@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
@@ -127,6 +127,7 @@ def create_app(
     dry_run: bool | None = None,
     enforce_claims: bool | None = None,
     service: ShakerService | None = None,
+    startup_retry_interval_s: float | None = None,
 ) -> FastAPI:
     if dry_run is None:
         dry_run = bool(_config.get("service", "dry_run", False))
@@ -141,9 +142,38 @@ def create_app(
     startup_timeout = float(
         _config.get("service", "startup_connect_timeout_s", 10.0)
     )
+    if startup_retry_interval_s is None:
+        startup_retry_interval_s = float(
+            _config.get("service", "startup_retry_interval_s", 30.0)
+        )
+
+    async def _auto_connect_retry() -> None:
+        # At boot the serial adapter can enumerate *after* this service
+        # (observed 2026-07-31: a PC restart stranded the device in
+        # requires_init for two days). Keep retrying until the first
+        # successful connect, then stop for good — a later operator
+        # /control/shutdown is deliberate and must not be fought.
+        attempt = 0
+        while True:
+            await asyncio.sleep(startup_retry_interval_s)
+            attempt += 1
+            try:
+                await asyncio.wait_for(service.startup(), timeout=startup_timeout)
+            except Exception as exc:
+                logger.info(
+                    "Shaker auto-connect retry %d failed: %s; retrying in %.0fs",
+                    attempt,
+                    exc,
+                    startup_retry_interval_s,
+                )
+                continue
+            service.clear_last_error_on_success()
+            logger.info("Shaker auto-connect retry %d succeeded", attempt)
+            return
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):  # noqa: ARG001
+        retry_task: asyncio.Task[None] | None = None
         try:
             await asyncio.wait_for(service.startup(), timeout=startup_timeout)
             logger.info("Shaker auto-connect succeeded")
@@ -154,9 +184,15 @@ def create_app(
             )
         except Exception as exc:
             logger.warning("Shaker auto-connect failed: %s", exc)
+        if not service.connected and startup_retry_interval_s > 0:
+            retry_task = asyncio.create_task(_auto_connect_retry())
         try:
             yield
         finally:
+            if retry_task is not None and not retry_task.done():
+                retry_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await retry_task
             try:
                 await service.claims.force_clear()
             except Exception:

@@ -329,6 +329,11 @@ class ShakerService:
 
     # ---- lifecycle ---------------------------------------------------------
 
+    @property
+    def connected(self) -> bool:
+        """True once a driver is attached (the dry-run stub counts)."""
+        return self._driver is not None
+
     def _create_driver(self) -> Any:
         if self._driver_factory is not None:
             return self._driver_factory()

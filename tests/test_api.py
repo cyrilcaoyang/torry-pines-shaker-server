@@ -294,3 +294,78 @@ def test_wait_for_temperature_short_circuits_when_in_band(client: TestClient) ->
     )
     assert r.status_code == 200
     client.post("/control/shake/stop")
+
+
+# ---------------------------------------------------------------------------
+# Boot-time auto-connect retry
+# ---------------------------------------------------------------------------
+
+
+def _flaky_factory(failures: int):
+    """Driver factory that fails ``failures`` times, then returns a stub.
+
+    Models the 2026-07-31 boot race: the USB serial adapter enumerates
+    *after* the service process starts, so the first open(s) fail.
+    """
+    from torry_pines_shaker_server.shaker_driver import StubShaker
+
+    calls = {"n": 0}
+
+    def factory():
+        calls["n"] += 1
+        if calls["n"] <= failures:
+            raise RuntimeError("could not open port 'COM6'")
+        return StubShaker()
+
+    return factory
+
+
+def _make_retry_app(failures: int, retry_interval_s: float):
+    from torry_pines_shaker_server.api import create_app
+    from torry_pines_shaker_server.service import ShakerService
+
+    svc = ShakerService(
+        dry_run=True,
+        driver_factory=_flaky_factory(failures),
+        enforce_claims=False,
+    )
+    return create_app(service=svc, startup_retry_interval_s=retry_interval_s)
+
+
+def _wait_for_status(c: TestClient, wanted: str, timeout_s: float = 5.0) -> str:
+    deadline = time.monotonic() + timeout_s
+    status = c.get("/status").json()["equipment_status"]
+    while status != wanted and time.monotonic() < deadline:
+        time.sleep(0.05)
+        status = c.get("/status").json()["equipment_status"]
+    return status
+
+
+def test_auto_connect_retry_recovers_from_boot_race() -> None:
+    """A driver that enumerates late is picked up by the background retry,
+    and the recorded init failure is cleared once the connect succeeds."""
+    app = _make_retry_app(failures=2, retry_interval_s=0.05)
+    with TestClient(app) as c:
+        assert _wait_for_status(c, "dry_run") == "dry_run"
+        assert c.get("/status").json()["last_error"] is None
+
+
+def test_auto_connect_retry_disabled_by_zero_interval() -> None:
+    app = _make_retry_app(failures=999, retry_interval_s=0.0)
+    with TestClient(app) as c:
+        time.sleep(0.3)
+        s = c.get("/status").json()
+        assert s["equipment_status"] == "requires_init"
+        assert s["last_error"]["code"] == "serial_init_failed"
+
+
+def test_auto_connect_retry_stops_after_first_success() -> None:
+    """The retry ends for good at the first successful connect: a later
+    operator /control/shutdown must not be fought by a lingering task."""
+    app = _make_retry_app(failures=1, retry_interval_s=0.05)
+    with TestClient(app) as c:
+        assert _wait_for_status(c, "dry_run") == "dry_run"
+        r = c.post("/control/shutdown")
+        assert r.status_code == 200
+        time.sleep(0.3)  # several retry intervals
+        assert c.get("/status").json()["equipment_status"] == "requires_init"
