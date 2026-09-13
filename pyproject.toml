@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "torry-pines-shaker-server"
-version = "0.2.2"
+version = "0.2.3"
 description = "REST API for the Torrey Pines Scientific shaker (lab status spec v1.2)"
 readme = "README.md"
 authors = [
@@ -40,6 +40,9 @@ torry-pines-shaker-serve = "torry_pines_shaker_server.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+torry_pines_shaker_server = ["docs/*.md"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

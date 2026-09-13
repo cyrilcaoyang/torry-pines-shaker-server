@@ -12,4 +12,4 @@ only want the package metadata don't pull in pyserial or FastAPI::
     from torry_pines_shaker_server.service import ShakerService
 """
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"

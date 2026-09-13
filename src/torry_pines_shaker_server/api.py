@@ -41,6 +41,8 @@ from pydantic import BaseModel, Field
 
 from . import config as _config
 from .claims import ClaimConflict, UnknownClaim
+from . import __version__
+from .documentation import router as documentation_router
 from .models import (
     PROTOCOL_VERSION,
     ClaimRejection,
@@ -201,14 +203,17 @@ def create_app(
 
     app = FastAPI(
         title="Torrey Pines Shaker API",
-        version="0.1.0",
+        version=__version__,
         description=(
             "REST API for the Torrey Pines Scientific shaker (SC20 series). "
             "Conforms to the AC lab equipment status spec v1.2 - see "
-            "`docs/STATUS_SPEC.md` in the ac-organic-lab monorepo."
+            "`docs/STATUS_SPEC.md` in the ac-organic-lab monorepo. Agents: read "
+            "[/agent-docs](/agent-docs) and [/agent-docs/api-reference]"
+            "(/agent-docs/api-reference); [/llms.txt](/llms.txt) indexes them."
         ),
         lifespan=lifespan,
     )
+    app.include_router(documentation_router)
 
     cors_origins: Any = _config.get("service", "cors_origins", ["*"])
     app.add_middleware(
@@ -311,8 +316,13 @@ def create_app(
 
     # ---- Control endpoints -----------------------------------------------
 
+    async def _claim_owner() -> str:
+        current = await service.claims.current()
+        return f"{current.owner}/{current.session_id}" if current else "no-claim"
+
     @app.post("/control/startup", response_model=CommandResponse, tags=["control"])
     async def control_startup(_claim: None = Depends(require_claim)) -> CommandResponse:
+        logger.info("startup requested by %s", await _claim_owner())
         try:
             await service.startup()
         except Exception as exc:
@@ -322,6 +332,14 @@ def create_app(
 
     @app.post("/control/shutdown", response_model=CommandResponse, tags=["control"])
     async def control_shutdown(_claim: None = Depends(require_claim)) -> CommandResponse:
+        # A shutdown is deliberate and is never fought by the auto-connect
+        # retry, so the device stays requires_init until someone POSTs
+        # /control/startup. Name who asked: on 2026-09-04 an agent session
+        # ended this way and the log held nothing to say so for eight days.
+        logger.warning(
+            "shutdown requested by %s — device will stay disconnected until /control/startup",
+            await _claim_owner(),
+        )
         await service.shutdown()
         service.clear_last_error_on_success()
         return CommandResponse(message="Disconnected")

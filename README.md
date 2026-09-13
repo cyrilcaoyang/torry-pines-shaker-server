@@ -52,6 +52,22 @@ Control (gated by `X-Claim-Token` when `enforce_claims=true`):
 `equipment_kind` is `"shaker"` (added to the v1.1 enum in
 `ac-organic-lab/docs/STATUS_SPEC.md` alongside this server).
 
+## Agent documentation
+
+Served by the running service so agents and the dashboard's API reference can
+discover it without the repo:
+
+- `GET /agent-docs` — Markdown agent guide (health vs activity, claims, the
+  startup/shutdown semantics, preconditions, error taxonomy).
+- `GET /agent-docs/api-reference` — Markdown route reference.
+- `GET /llms.txt` — plain-text index of the above plus `/openapi.json`.
+
+`POST /control/startup` and `POST /control/shutdown` are logged with the claim
+owner. A shutdown is deliberate: the boot-time retry never fights it, so the
+device stays `requires_init` until someone POSTs `/control/startup` (v0.2.3;
+motivated by an agent session that ended on `shutdown` on 2026-09-04 and left
+the shaker disconnected for eight days with no log line to say so).
+
 ## Precondition catalog (spec §6)
 
 Availability is decided per **subsystem**, not per coarse state, by one
