@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from importlib.resources import files
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter
 from fastapi.responses import PlainTextResponse
 
 router = APIRouter(tags=["documentation"])
@@ -40,12 +40,14 @@ async def api_reference() -> str:
 
 
 @router.get("/llms.txt", response_class=PlainTextResponse, summary="Discovery index for agents")
-async def llms_txt(request: Request) -> str:
-    root = str(request.base_url).rstrip("/")
+async def llms_txt() -> str:
     return (
         "# Torrey Pines SC25XR shaker (STATUS_SPEC v1.2 device service)\n\n"
-        f"- [Agent guide]({root}/agent-docs): health vs activity, claims, startup/shutdown semantics, preconditions.\n"
-        f"- [API reference]({root}/agent-docs/api-reference): every route with bodies and refusal codes.\n"
-        f"- [OpenAPI]({root}/openapi.json): request/response schemas.\n"
-        f"- [Live status]({root}/status): the STATUS_SPEC envelope — read allowed_actions before acting.\n"
+        "## Documentation\n\n"
+        "- [Agent guide](agent-docs): health vs activity, claims, startup/shutdown semantics, preconditions.\n"
+        "- [API reference](agent-docs/api-reference): every route with bodies and refusal codes.\n"
+        "- [OpenAPI](openapi.json): request/response schemas.\n\n"
+        "## Live status\n\n"
+        "Read the service's `GET /status` through the lab-skills SDK or dashboard; "
+        "live status is not a documentation-proxy resource. Read allowed_actions before acting.\n"
     )
