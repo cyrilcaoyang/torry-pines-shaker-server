@@ -209,11 +209,29 @@ All tests use `dry_run=True` so no hardware is required.
 - **SC25XR v6.1, serial 50014748:** if the controller starts
   returning `cal3` (*"High Point Measured Cal Value is Lower than
   Low Point Measured Value"*) to `p` (read-temperature) queries,
-  the RTD calibration table needs to be re-flashed via the Torrey
-  Pines front-panel procedure. Model, serial, speed (`m`), and
-  target (`s`) queries are unaffected. A failed temperature read
-  surfaces as `readback_errors` &rarr; `equipment_status="degraded"`
-  in the spec envelope; the motor side stays usable.
+  the calibration points need to be reset at the front panel.
+  Model, serial, speed (`m`), and target (`s`) queries are
+  unaffected. A failed temperature read surfaces as
+  `readback_errors` &rarr; `equipment_status="degraded"` in the spec
+  envelope; the motor side stays usable.
+- **Clearing `cal3` (2026-09-23):** `#F` (restore factory cal) answers
+  `ok` but does **not** clear it on this unit — `#m` reads
+  `-1,-1,-1,-1` before and after, i.e. the stored factory points are
+  blank. What works is Menu &rarr; *Reset Cal Pts* &rarr; *Set to Not
+  Cal* (front panel only; there is no serial command for it), followed
+  by a two-point user calibration against a reference probe (Menu
+  &rarr; *Calibrate* &rarr; *Hi/Lo Temp Cal Pt*, plate stable
+  &ge;10 min at each point). Never save the `Measured` field without
+  editing it to the probe reading — the pre-filled value is not a
+  measurement. Calibrated 4 °C / 95 °C at plate centre; `#m` now
+  reads `375,496,9507,9603` (hundredths of °C: displayed-lo,
+  measured-lo, displayed-hi, measured-hi).
+- **Serial link after a USB drop:** if the PL2303 adapter drops off
+  the bus and comes back, the SC25XR may stay silent on the port
+  (0 bytes to `v`/`p`, reads fail with *"End index is less than
+  start index"*) until the shaker itself is power-cycled at the rear
+  switch. Calibration points survive the power cycle. `POST
+  /control/startup` afterwards to reconnect the service.
 
 ## Concurrency
 
